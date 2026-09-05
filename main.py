@@ -22,6 +22,21 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # Mount static folder for frontend files
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+def get_ydl_base_opts():
+    opts = {
+        'quiet': True,
+        'js_runtimes': {'deno': {}},
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web']
+            }
+        }
+    }
+    cookie_path = BASE_DIR / "cookies.txt"
+    if cookie_path.exists():
+        opts['cookiefile'] = str(cookie_path)
+    return opts
+
 @app.get("/", response_class=HTMLResponse)
 async def read_index():
     index_file = STATIC_DIR / "index.html"
@@ -34,10 +49,7 @@ async def read_index():
 async def get_video_info(url: str):
     """Extracts title, thumbnail, and available resolutions for the video."""
     try:
-        ydl_opts = {
-            'quiet': True,
-            'js_runtimes': {'deno': {}},  # Fixed syntax: nested dictionary format
-        }
+        ydl_opts = get_ydl_base_opts()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             
@@ -74,24 +86,26 @@ async def process_stream(url: str, title: str, format: str, height: str = "720p"
     """Streams live download progress updates back to the browser via SSE."""
     file_id = str(uuid.uuid4())
     
-    # Corrected nested dictionary configuration for JS runtimes
-    base_ydl_opts = {
-        'js_runtimes': {'deno': {}},  # Change to {'node': {}} if using Node.js
-    }
+    # Sanitize video title to be safe for filenames
+    safe_title = re.sub(r'[\\/*?:"<>|]', "", title).strip()
+    if not safe_title:
+        safe_title = "media"
+    
+    base_ydl_opts = get_ydl_base_opts()
     
     if format == 'mp4':
         target_height = height.replace('p', '')
         ydl_opts = {
             **base_ydl_opts,
             'format': f"bestvideo[height<={target_height}]+bestaudio/best[height<={target_height}]/best",
-            'outtmpl': str(DOWNLOAD_DIR / f"{file_id}.%(ext)s"),
+            'outtmpl': str(DOWNLOAD_DIR / f"{file_id}_{safe_title}.%(ext)s"), # <--- Includes safe_title here
             'merge_output_format': 'mp4',
         }
     else:
         ydl_opts = {
             **base_ydl_opts,
             'format': 'bestaudio/best',
-            'outtmpl': str(DOWNLOAD_DIR / f"{file_id}.%(ext)s"),
+            'outtmpl': str(DOWNLOAD_DIR / f"{file_id}_{safe_title}.%(ext)s"), # <--- Includes safe_title here
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
@@ -108,7 +122,6 @@ async def process_stream(url: str, title: str, format: str, height: str = "720p"
 
         ydl_opts['progress_hooks'] = [sync_hook]
 
-        # Run yt-dlp download in a separate thread to prevent blocking FastAPI's loop
         loop_task = loop.run_in_executor(
             None, lambda: run_download(ydl_opts, url)
         )
@@ -131,7 +144,6 @@ async def process_stream(url: str, title: str, format: str, height: str = "720p"
 
             await loop_task
             
-            # Send completion response containing the file unique identifier
             yield f"data: {json.dumps({'status': 'complete', 'fileId': file_id})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'status': 'error', 'message': str(e)})}\n\n"
@@ -144,14 +156,15 @@ def run_download(opts, url):
 
 @app.get("/api/get-file")
 async def get_file(fileId: str):
-    """Sends the compiled video or audio file back to the browser for downloading safely."""
+    """Sends the compiled video or audio file back to the browser using its original video title."""
     if not DOWNLOAD_DIR.exists():
         raise HTTPException(status_code=404, detail="Downloads directory missing")
 
-    # Search explicitly for files starting with the unique fileId UUID
     for file_path in DOWNLOAD_DIR.iterdir():
         if file_path.is_file() and file_path.name.startswith(fileId):
-            return FileResponse(path=str(file_path), filename=file_path.name)
+            # Strip out the UUID prefix and underscore so the original filename is preserved on download
+            original_filename = file_path.name.split("_", 1)[1] if "_" in file_path.name else file_path.name
+            return FileResponse(path=str(file_path), filename=original_filename)
             
     raise HTTPException(status_code=404, detail="File not found on disk")
 
